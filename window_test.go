@@ -235,7 +235,7 @@ func resolveLegacy(rangeLabel, startStr, endStr string, now time.Time) (start, e
 func TestParseWindowMatchesTheReplacedImplementation(t *testing.T) {
 	labels := []string{
 		"", "   ", "24h", "1d", "day", "today", "7d", "week", "30d", "month",
-		"24H", " 7d ", "custom", "CUSTOM", "yesterday", "1h", "all",
+		"24H", " 7d ", "custom", "CUSTOM", "yesterday",
 	}
 	bounds := []string{
 		"", "   ", "2026-07-01T00:00:00Z", "2026-07-25T12:00:00Z", "2026-07-26T00:00:00Z",
@@ -286,4 +286,120 @@ func legacyStep(interval string) time.Duration {
 		return 24 * time.Hour
 	}
 	return time.Hour
+}
+
+// A count and a unit resolve on their own, so a window nobody enumerated still
+// answers. These are the ones a spend view asks for; the point is that the set
+// is not a list anyone has to remember to extend.
+func TestParseWindowReadsTheCount(t *testing.T) {
+	for _, tc := range []struct {
+		label string
+		back  time.Duration
+		want  Interval
+	}{
+		{"1h", time.Hour, Hour},
+		{"6h", 6 * time.Hour, Hour},
+		{"12h", 12 * time.Hour, Hour},
+		{"48h", 48 * time.Hour, Hour},
+		{"49h", 49 * time.Hour, Day},
+		{"14d", 14 * 24 * time.Hour, Day},
+		{"60d", 60 * 24 * time.Hour, Day},
+		{"90d", 90 * 24 * time.Hour, Day},
+		{"180d", 180 * 24 * time.Hour, Day},
+		{"365d", 365 * 24 * time.Hour, Day},
+		{"90D", 90 * 24 * time.Hour, Day},
+		{"  90d  ", 90 * 24 * time.Hour, Day},
+		{"730d", Horizon, Day},
+		{"17520h", Horizon, Day},
+		{"all", Horizon, Day},
+		{"ALL", Horizon, Day},
+	} {
+		t.Run(strings.TrimSpace(tc.label), func(t *testing.T) {
+			w, err := ParseWindow(tc.label, "", "", now)
+			if err != nil {
+				t.Fatalf("ParseWindow(%q) errored: %v", tc.label, err)
+			}
+			if !w.End.Equal(now) {
+				t.Errorf("End = %v, want %v", w.End, now)
+			}
+			if !w.Start.Equal(now.Add(-tc.back)) {
+				t.Errorf("Start = %v, want %v (span %v, want %v)", w.Start, now.Add(-tc.back), w.End.Sub(w.Start), tc.back)
+			}
+			if w.Interval != tc.want {
+				t.Errorf("Interval = %q, want %q", w.Interval, tc.want)
+			}
+		})
+	}
+}
+
+// Past the horizon the answer would be a window the store cannot fill, so it is
+// refused by name. Serving it short would read as a quiet zero on a spend view.
+func TestParseWindowRefusesPastTheHorizon(t *testing.T) {
+	for _, label := range []string{"731d", "1000d", "17521h", "3650d"} {
+		t.Run(label, func(t *testing.T) {
+			w, err := ParseWindow(label, "", "", now)
+			if err == nil {
+				t.Fatalf("want a refusal, got window %+v", w)
+			}
+			want := fmt.Sprintf("range %q reaches past the 730-day horizon; \"all\" is the longest window", label)
+			if err.Error() != want {
+				t.Errorf("error = %q, want %q", err.Error(), want)
+			}
+			if w != (Window{}) {
+				t.Errorf("refused window must be zero, got %+v", w)
+			}
+		})
+	}
+}
+
+// A count is read, not guessed: a unit this grammar does not carry stays an
+// unknown range rather than becoming some nearby window.
+func TestParseWindowStillRefusesNonCounts(t *testing.T) {
+	for _, label := range []string{"1w", "3mo", "0d", "0h", "-5d", "+5d", "d", "h", "lastweek", "1.5d", "d7"} {
+		t.Run(label, func(t *testing.T) {
+			w, err := ParseWindow(label, "", "", now)
+			if err == nil {
+				t.Fatalf("want a refusal, got window %+v", w)
+			}
+			if want := fmt.Sprintf("unknown range %q", label); err.Error() != want {
+				t.Errorf("error = %q, want %q", err.Error(), want)
+			}
+			if w != (Window{}) {
+				t.Errorf("refused window must be zero, got %+v", w)
+			}
+		})
+	}
+}
+
+// The widening is strictly additive: every label the replaced implementation
+// admitted still resolves to the very same window (the oracle test above), and
+// every label this one adds is one that used to be a 400. Nothing quietly
+// changed meaning underneath a caller.
+func TestParseWindowOnlyAddsToWhatWasAdmitted(t *testing.T) {
+	for _, label := range []string{"1h", "6h", "14d", "90d", "180d", "365d", "all"} {
+		t.Run(label, func(t *testing.T) {
+			if _, _, _, err := resolveLegacy(label, "", "", now); err == nil {
+				t.Fatalf("%q was already admitted; it is not part of the widening", label)
+			}
+			if _, err := ParseWindow(label, "", "", now); err != nil {
+				t.Fatalf("ParseWindow(%q) still refuses: %v", label, err)
+			}
+		})
+	}
+}
+
+// Horizon is the retention the warehouses behind these series keep, and "all"
+// has to be exactly it — an "all" longer than the store would report empty
+// buckets as though nothing had been spent in them.
+func TestAllIsTheHorizon(t *testing.T) {
+	w, err := ParseWindow("all", "", "", now)
+	if err != nil {
+		t.Fatalf("errored: %v", err)
+	}
+	if got := w.End.Sub(w.Start); got != Horizon {
+		t.Errorf("all spans %v, want the %v horizon", got, Horizon)
+	}
+	if got, want := int(Horizon/(24*time.Hour)), 730; got != want {
+		t.Errorf("horizon = %d days, want %d", got, want)
+	}
 }

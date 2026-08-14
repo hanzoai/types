@@ -1,6 +1,7 @@
 package types
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -41,12 +42,25 @@ type Window struct {
 	Interval Interval
 }
 
+// Horizon is how far back a window may reach: the retention the warehouses
+// behind these series keep. "all" resolves to exactly this, so a caller asking
+// for everything is told the real span it got rather than an open bound the
+// store cannot honour.
+const Horizon = 2 * 365 * 24 * time.Hour
+
 // ParseWindow resolves a range request into an absolute window.
 //
-// "24h", "7d" and "30d", with their aliases, are relative to now. "custom"
-// reads start and end, each RFC3339 or unix seconds; end defaults to now and
-// must follow start. An unrecognised label is an error rather than a silent
-// default, so a typo cannot quietly change the window a caller is shown.
+// A relative label is a count and a unit — "24h", "90d", any <N>h or <N>d up to
+// Horizon — so a window nobody enumerated still resolves. "day", "week" and
+// "month" name the common ones, "all" reaches back to Horizon, and "custom"
+// reads start and end, each RFC3339 or unix seconds, end defaulting to now and
+// having to follow start.
+//
+// A label that is neither is an error rather than a silent default, so a typo
+// cannot quietly change the window a caller is shown, and a span past Horizon
+// is refused by its own name rather than served short: on a series that carries
+// money, a window that answers less than it was asked for is worse than one
+// that refuses.
 //
 // now is a parameter so the window is a function of the arguments alone.
 func ParseWindow(label, start, end string, now time.Time) (Window, error) {
@@ -57,14 +71,7 @@ func ParseWindow(label, start, end string, now time.Time) (Window, error) {
 		w.Label = "24h"
 	}
 
-	switch strings.ToLower(strings.TrimSpace(label)) {
-	case "", "24h", "1d", "day", "today":
-		w.Start, w.End, w.Interval = now.Add(-24*time.Hour), now, Hour
-	case "7d", "week":
-		w.Start, w.End, w.Interval = now.Add(-7*24*time.Hour), now, Day
-	case "30d", "month":
-		w.Start, w.End, w.Interval = now.Add(-30*24*time.Hour), now, Day
-	case "custom":
+	if strings.EqualFold(w.Label, "custom") {
 		from, err := parseTime(start)
 		if err != nil {
 			return Window{}, fmt.Errorf("custom range requires a valid start: %w", err)
@@ -78,15 +85,77 @@ func ParseWindow(label, start, end string, now time.Time) (Window, error) {
 		if !to.After(from) {
 			return Window{}, fmt.Errorf("custom range end must be after start")
 		}
-		w.Start, w.End, w.Interval = from.UTC(), to.UTC(), Hour
-		if w.End.Sub(w.Start) > 48*time.Hour {
-			w.Interval = Day
-		}
-	default:
-		return Window{}, fmt.Errorf("unknown range %q", label)
+		w.Start, w.End = from.UTC(), to.UTC()
+		w.Interval = bucket(w.End.Sub(w.Start))
+		return w, nil
 	}
 
+	back, err := span(w.Label)
+	if errors.Is(err, errPastHorizon) {
+		return Window{}, fmt.Errorf("range %q reaches past the %d-day horizon; %q is the longest window", label, int(Horizon/(24*time.Hour)), "all")
+	}
+	if err != nil {
+		return Window{}, fmt.Errorf("unknown range %q", label)
+	}
+	w.Start, w.End, w.Interval = now.Add(-back), now, bucket(back)
 	return w, nil
+}
+
+// The two ways a relative label fails, distinguished because they mean opposite
+// things to a caller: one is a typo, the other is a window the stores behind
+// these series do not go back far enough to answer.
+var (
+	errUnknown     = errors.New("unknown range")
+	errPastHorizon = errors.New("range reaches past the horizon")
+)
+
+// span is how far back a relative label reaches. The named windows are the
+// counts worth a word; every other count is read off the label itself.
+func span(label string) (time.Duration, error) {
+	unit := time.Hour
+	count := 0
+
+	switch strings.ToLower(label) {
+	case "today", "day":
+		count = 24
+	case "week":
+		count, unit = 7, 24*time.Hour
+	case "month":
+		count, unit = 30, 24*time.Hour
+	case "all":
+		return Horizon, nil
+	default:
+		digits, u := label[:len(label)-1], label[len(label)-1]
+		switch u {
+		case 'd', 'D':
+			unit = 24 * time.Hour
+		case 'h', 'H':
+			unit = time.Hour
+		default:
+			return 0, errUnknown
+		}
+		n, err := strconv.Atoi(digits)
+		if err != nil || n <= 0 || digits[0] < '0' || digits[0] > '9' {
+			return 0, errUnknown
+		}
+		count = n
+	}
+
+	// Compared before multiplying, so a count no store could serve is refused
+	// rather than overflowing into a window that looks small.
+	if int64(count) > int64(Horizon/unit) {
+		return 0, errPastHorizon
+	}
+	return time.Duration(count) * unit, nil
+}
+
+// bucket is the interval a span of this width buckets to. One rule for every
+// window, named or counted, so two ranges of the same length cannot disagree.
+func bucket(d time.Duration) Interval {
+	if d > 48*time.Hour {
+		return Day
+	}
+	return Hour
 }
 
 // parseTime accepts RFC3339 or a unix-seconds string.
